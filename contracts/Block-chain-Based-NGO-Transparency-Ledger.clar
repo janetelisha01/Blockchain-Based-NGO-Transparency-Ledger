@@ -7,6 +7,8 @@
 (define-constant ERR_INVALID_AMOUNT (err u105))
 (define-constant ERR_NGO_ALREADY_EXISTS (err u106))
 
+(define-data-var next-milestone-id uint u1)
+
 (define-map ngos
   { ngo-id: uint }
   {
@@ -222,4 +224,144 @@
 
 (define-read-only (get-contract-owner)
   CONTRACT_OWNER
+)
+
+(define-map ngo-milestones
+  { milestone-id: uint }
+  {
+    ngo-id: uint,
+    title: (string-ascii 100),
+    target-amount: uint,
+    current-progress: uint,
+    deadline-block: uint,
+    is-completed: bool,
+    completion-block: (optional uint),
+    category: (string-ascii 50)
+  }
+)
+
+(define-map ngo-performance-metrics
+  { ngo-id: uint }
+  {
+    total-milestones: uint,
+    completed-milestones: uint,
+    avg-completion-time: uint,
+    efficiency-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-public (create-milestone 
+  (ngo-id uint) 
+  (title (string-ascii 100)) 
+  (target-amount uint) 
+  (deadline-blocks uint)
+  (category (string-ascii 50))
+)
+  (let
+    (
+      (milestone-id (var-get next-milestone-id))
+      (ngo-data (unwrap! (map-get? ngos { ngo-id: ngo-id }) ERR_NGO_NOT_FOUND))
+      (current-metrics (default-to 
+        { total-milestones: u0, completed-milestones: u0, avg-completion-time: u0, efficiency-score: u0, last-updated: u0 }
+        (map-get? ngo-performance-metrics { ngo-id: ngo-id })
+      ))
+    )
+    (asserts! (is-eq tx-sender (get wallet ngo-data)) ERR_UNAUTHORIZED)
+    (asserts! (> target-amount u0) ERR_INVALID_AMOUNT)
+    (map-set ngo-milestones
+      { milestone-id: milestone-id }
+      {
+        ngo-id: ngo-id,
+        title: title,
+        target-amount: target-amount,
+        current-progress: u0,
+        deadline-block: (+ stacks-block-height deadline-blocks),
+        is-completed: false,
+        completion-block: none,
+        category: category
+      }
+    )
+    (map-set ngo-performance-metrics
+      { ngo-id: ngo-id }
+      (merge current-metrics { 
+        total-milestones: (+ (get total-milestones current-metrics) u1),
+        last-updated: stacks-block-height
+      })
+    )
+    (var-set next-milestone-id (+ milestone-id u1))
+    (ok milestone-id)
+  )
+)
+
+(define-public (update-milestone-progress (milestone-id uint) (progress-amount uint))
+  (let
+    (
+      (milestone-data (unwrap! (map-get? ngo-milestones { milestone-id: milestone-id }) ERR_EXPENSE_NOT_FOUND))
+      (ngo-data (unwrap! (map-get? ngos { ngo-id: (get ngo-id milestone-data) }) ERR_NGO_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get wallet ngo-data)) ERR_UNAUTHORIZED)
+    (asserts! (not (get is-completed milestone-data)) ERR_INVALID_AMOUNT)
+    (let
+      (
+        (new-progress (+ (get current-progress milestone-data) progress-amount))
+        (is-now-completed (>= new-progress (get target-amount milestone-data)))
+      )
+      (map-set ngo-milestones
+        { milestone-id: milestone-id }
+        (merge milestone-data {
+          current-progress: new-progress,
+          is-completed: is-now-completed,
+          completion-block: (if is-now-completed (some stacks-block-height) none)
+        })
+      )
+      (if is-now-completed
+        (begin
+          (update-performance-metrics (get ngo-id milestone-data))
+          (ok true)
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-private (update-performance-metrics (ngo-id uint))
+  (let
+    (
+      (current-metrics (default-to 
+        { total-milestones: u0, completed-milestones: u0, avg-completion-time: u0, efficiency-score: u0, last-updated: u0 }
+        (map-get? ngo-performance-metrics { ngo-id: ngo-id })
+      ))
+      (new-completed (+ (get completed-milestones current-metrics) u1))
+      (efficiency (if (> (get total-milestones current-metrics) u0)
+        (/ (* new-completed u100) (get total-milestones current-metrics))
+        u0
+      ))
+    )
+    (map-set ngo-performance-metrics
+      { ngo-id: ngo-id }
+      (merge current-metrics {
+        completed-milestones: new-completed,
+        efficiency-score: efficiency,
+        last-updated: stacks-block-height
+      })
+    )
+  )
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+  (map-get? ngo-milestones { milestone-id: milestone-id })
+)
+
+(define-read-only (get-ngo-performance (ngo-id uint))
+  (map-get? ngo-performance-metrics { ngo-id: ngo-id })
+)
+
+(define-read-only (get-milestone-progress-percentage (milestone-id uint))
+  (match (map-get? ngo-milestones { milestone-id: milestone-id })
+    milestone-data 
+    (ok (/ (* (get current-progress milestone-data) u100) (get target-amount milestone-data)))
+    ERR_EXPENSE_NOT_FOUND
+  )
 )
