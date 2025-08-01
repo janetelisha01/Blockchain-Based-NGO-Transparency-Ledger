@@ -7,6 +7,10 @@
 (define-constant ERR_INVALID_AMOUNT (err u105))
 (define-constant ERR_NGO_ALREADY_EXISTS (err u106))
 
+(define-constant ERR_ALERT_NOT_FOUND (err u107))
+(define-constant ERR_ALREADY_REPORTED (err u108))
+(define-constant ERR_INVALID_THRESHOLD (err u109))
+
 (define-data-var next-milestone-id uint u1)
 
 (define-map ngos
@@ -363,5 +367,145 @@
     milestone-data 
     (ok (/ (* (get current-progress milestone-data) u100) (get target-amount milestone-data)))
     ERR_EXPENSE_NOT_FOUND
+  )
+)
+
+
+(define-private (min (a uint) (b uint))
+  (if (< a b) a b)
+)
+
+(define-data-var next-alert-id uint u1)
+(define-data-var fraud-threshold-percentage uint u20)
+
+(define-map fraud-alerts
+  { alert-id: uint }
+  {
+    ngo-id: uint,
+    alert-type: (string-ascii 20),
+    severity: uint,
+    description: (string-ascii 200),
+    triggered-by: principal,
+    timestamp: uint,
+    is-resolved: bool,
+    resolution-notes: (optional (string-ascii 300))
+  }
+)
+
+(define-map community-reports
+  { ngo-id: uint, reporter: principal }
+  {
+    report-count: uint,
+    last-report-block: uint,
+    total-severity: uint
+  }
+)
+
+(define-map ngo-alert-stats
+  { ngo-id: uint }
+  {
+    total-alerts: uint,
+    active-alerts: uint,
+    community-reports: uint,
+    risk-score: uint
+  }
+)
+
+(define-public (trigger-spending-alert (ngo-id uint) (expense-amount uint))
+  (let
+    (
+      (alert-id (var-get next-alert-id))
+      (ngo-data (unwrap! (map-get? ngos { ngo-id: ngo-id }) ERR_NGO_NOT_FOUND))
+      (spending-percentage (if (> (get total-received ngo-data) u0)
+        (/ (* expense-amount u100) (get total-received ngo-data))
+        u0))
+      (threshold (var-get fraud-threshold-percentage))
+    )
+    (if (>= spending-percentage threshold)
+      (begin
+        (map-set fraud-alerts
+          { alert-id: alert-id }
+          {
+            ngo-id: ngo-id,
+            alert-type: "HIGH_SPENDING",
+            severity: (min u10 (/ spending-percentage u10)),
+            description: "Expense exceeds risk threshold",
+            triggered-by: tx-sender,
+            timestamp: stacks-block-height,
+            is-resolved: false,
+            resolution-notes: none
+          }
+        )
+        (update-alert-stats ngo-id true)
+        (var-set next-alert-id (+ alert-id u1))
+        (ok alert-id)
+      )
+      (ok u0)
+    )
+  )
+)
+
+(define-public (submit-community-report (ngo-id uint) (severity uint) (reason (string-ascii 200)))
+  (let
+    (
+      (alert-id (var-get next-alert-id))
+      (existing-report (map-get? community-reports { ngo-id: ngo-id, reporter: tx-sender }))
+    )
+    (asserts! (is-none existing-report) ERR_ALREADY_REPORTED)
+    (asserts! (<= severity u10) ERR_INVALID_THRESHOLD)
+    (map-set fraud-alerts
+      { alert-id: alert-id }
+      {
+        ngo-id: ngo-id,
+        alert-type: "COMMUNITY",
+        severity: severity,
+        description: reason,
+        triggered-by: tx-sender,
+        timestamp: stacks-block-height,
+        is-resolved: false,
+        resolution-notes: none
+      }
+    )
+    (map-set community-reports
+      { ngo-id: ngo-id, reporter: tx-sender }
+      {
+        report-count: u1,
+        last-report-block: stacks-block-height,
+        total-severity: severity
+      }
+    )
+    (update-alert-stats ngo-id true)
+    (var-set next-alert-id (+ alert-id u1))
+    (ok alert-id)
+  )
+)
+
+(define-private (update-alert-stats (ngo-id uint) (is-new-alert bool))
+  (let
+    (
+      (current-stats (default-to 
+        { total-alerts: u0, active-alerts: u0, community-reports: u0, risk-score: u0 }
+        (map-get? ngo-alert-stats { ngo-id: ngo-id })
+      ))
+    )
+    (map-set ngo-alert-stats
+      { ngo-id: ngo-id }
+      (merge current-stats {
+        total-alerts: (if is-new-alert (+ (get total-alerts current-stats) u1) (get total-alerts current-stats)),
+        active-alerts: (if is-new-alert (+ (get active-alerts current-stats) u1) (- (get active-alerts current-stats) u1)),
+        risk-score: (min u100 (* (get active-alerts current-stats) u15))
+      })
+    )
+  )
+)
+
+(define-read-only (get-fraud-alert (alert-id uint))
+  (map-get? fraud-alerts { alert-id: alert-id })
+)
+
+(define-read-only (get-ngo-risk-score (ngo-id uint))
+  (match (map-get? ngo-alert-stats { ngo-id: ngo-id })
+    stats (ok (get risk-score stats))
+    (ok u0)
   )
 )
