@@ -509,3 +509,108 @@
     (ok u0)
   )
 )
+
+(define-constant ERR_DONOR_NOT_FOUND (err u110))
+
+(define-map donor-reputation
+  { donor: principal }
+  {
+    total-donated: uint,
+    donation-count: uint,
+    reputation-score: uint,
+    achievement-tier: uint,
+    streak-count: uint,
+    last-donation-block: uint,
+    badges: uint
+  }
+)
+
+(define-map donor-achievements
+  { achievement-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 100),
+    requirement-type: (string-ascii 20),
+    threshold-value: uint,
+    badge-points: uint
+  }
+)
+
+(define-data-var next-achievement-id uint u1)
+
+(define-private (initialize-achievements)
+  (begin
+    (map-set donor-achievements { achievement-id: u1 } 
+      { name: "First Drop", description: "Made your first donation", 
+        requirement-type: "DONATION_COUNT", threshold-value: u1, badge-points: u10 })
+    (map-set donor-achievements { achievement-id: u2 } 
+      { name: "Generous Soul", description: "Donated over 10,000 STX total", 
+        requirement-type: "TOTAL_AMOUNT", threshold-value: u10000000000, badge-points: u50 })
+    (map-set donor-achievements { achievement-id: u3 } 
+      { name: "Consistent Giver", description: "Made 10+ donations", 
+        requirement-type: "DONATION_COUNT", threshold-value: u10, badge-points: u25 })
+    (var-set next-achievement-id u4)
+  )
+)
+
+(define-public (update-donor-reputation (donor principal) (donation-amount uint))
+  (let
+    (
+      (current-reputation (default-to 
+        { total-donated: u0, donation-count: u0, reputation-score: u0, 
+          achievement-tier: u0, streak-count: u0, last-donation-block: u0, badges: u0 }
+        (map-get? donor-reputation { donor: donor })
+      ))
+      (new-total (+ (get total-donated current-reputation) donation-amount))
+      (new-count (+ (get donation-count current-reputation) u1))
+      (blocks-since-last (- stacks-block-height (get last-donation-block current-reputation)))
+      (streak-bonus (if (< blocks-since-last u1440) u1 u0))
+      (new-streak (+ (get streak-count current-reputation) streak-bonus))
+      (base-score (+ (* new-count u10) (/ new-total u1000000)))
+      (streak-multiplier (+ u100 (* new-streak u5)))
+      (final-score (/ (* base-score streak-multiplier) u100))
+      (new-tier (min u5 (/ final-score u100)))
+    )
+    (map-set donor-reputation
+      { donor: donor }
+      {
+        total-donated: new-total,
+        donation-count: new-count,
+        reputation-score: final-score,
+        achievement-tier: new-tier,
+        streak-count: new-streak,
+        last-donation-block: stacks-block-height,
+        badges: (check-and-award-badges donor new-total new-count)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (check-and-award-badges (donor principal) (total-donated uint) (donation-count uint))
+  (let
+    (
+      (current-badges (get badges (default-to 
+        { total-donated: u0, donation-count: u0, reputation-score: u0, 
+          achievement-tier: u0, streak-count: u0, last-donation-block: u0, badges: u0 }
+        (map-get? donor-reputation { donor: donor })
+      )))
+      (badge-1 (if (>= donation-count u1) u1 u0))
+      (badge-2 (if (>= total-donated u10000000000) u2 u0))
+      (badge-3 (if (>= donation-count u10) u4 u0))
+    )
+    (+ current-badges badge-1 badge-2 badge-3)
+  )
+)
+
+(define-read-only (get-donor-reputation (donor principal))
+  (map-get? donor-reputation { donor: donor })
+)
+
+(define-read-only (get-donor-tier-name (tier uint))
+  (if (is-eq tier u0) "Newcomer"
+  (if (is-eq tier u1) "Supporter" 
+  (if (is-eq tier u2) "Advocate"
+  (if (is-eq tier u3) "Champion"
+  (if (is-eq tier u4) "Guardian" "Legend")))))
+)
