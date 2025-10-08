@@ -11,6 +11,13 @@
 (define-constant ERR_ALREADY_REPORTED (err u108))
 (define-constant ERR_INVALID_THRESHOLD (err u109))
 
+(define-constant ERR_ESCROW_NOT_FOUND (err u111))
+(define-constant ERR_ESCROW_LOCKED (err u112))
+(define-constant ERR_CONDITION_NOT_MET (err u113))
+(define-constant ERR_DEADLINE_PASSED (err u114))
+
+(define-data-var next-escrow-id uint u1)
+
 (define-data-var next-milestone-id uint u1)
 
 (define-map ngos
@@ -613,4 +620,138 @@
   (if (is-eq tier u2) "Advocate"
   (if (is-eq tier u3) "Champion"
   (if (is-eq tier u4) "Guardian" "Legend")))))
+)
+
+
+(define-map escrow-deposits
+  { escrow-id: uint }
+  {
+    donor: principal,
+    ngo-id: uint,
+    amount: uint,
+    condition-type: (string-ascii 20),
+    condition-value: uint,
+    deadline-block: uint,
+    is-released: bool,
+    release-block: (optional uint),
+    created-at: uint
+  }
+)
+
+(define-map escrow-balances
+  { ngo-id: uint }
+  { total-locked: uint, total-released: uint, pending-count: uint }
+)
+
+(define-public (deposit-to-escrow 
+  (ngo-id uint) 
+  (amount uint) 
+  (condition-type (string-ascii 20))
+  (condition-value uint)
+  (deadline-blocks uint)
+)
+  (let
+    (
+      (escrow-id (var-get next-escrow-id))
+      (ngo-data (unwrap! (map-get? ngos { ngo-id: ngo-id }) ERR_NGO_NOT_FOUND))
+      (current-balance (default-to 
+        { total-locked: u0, total-released: u0, pending-count: u0 }
+        (map-get? escrow-balances { ngo-id: ngo-id })
+      ))
+    )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set escrow-deposits
+      { escrow-id: escrow-id }
+      {
+        donor: tx-sender,
+        ngo-id: ngo-id,
+        amount: amount,
+        condition-type: condition-type,
+        condition-value: condition-value,
+        deadline-block: (+ stacks-block-height deadline-blocks),
+        is-released: false,
+        release-block: none,
+        created-at: stacks-block-height
+      }
+    )
+    (map-set escrow-balances
+      { ngo-id: ngo-id }
+      (merge current-balance {
+        total-locked: (+ (get total-locked current-balance) amount),
+        pending-count: (+ (get pending-count current-balance) u1)
+      })
+    )
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-public (release-escrow (escrow-id uint))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrow-deposits { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+      (ngo-data (unwrap! (map-get? ngos { ngo-id: (get ngo-id escrow-data) }) ERR_NGO_NOT_FOUND))
+      (escrow-balance (unwrap! (map-get? escrow-balances { ngo-id: (get ngo-id escrow-data) }) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (not (get is-released escrow-data)) ERR_ESCROW_LOCKED)
+    (asserts! (<= stacks-block-height (get deadline-block escrow-data)) ERR_DEADLINE_PASSED)
+    (asserts! (check-condition escrow-data) ERR_CONDITION_NOT_MET)
+    (try! (as-contract (stx-transfer? (get amount escrow-data) tx-sender (get wallet ngo-data))))
+    (map-set escrow-deposits
+      { escrow-id: escrow-id }
+      (merge escrow-data { is-released: true, release-block: (some stacks-block-height) })
+    )
+    (map-set escrow-balances
+      { ngo-id: (get ngo-id escrow-data) }
+      (merge escrow-balance {
+        total-released: (+ (get total-released escrow-balance) (get amount escrow-data)),
+        pending-count: (- (get pending-count escrow-balance) u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-private (check-condition (escrow-data {
+  donor: principal, ngo-id: uint, amount: uint, condition-type: (string-ascii 20),
+  condition-value: uint, deadline-block: uint, is-released: bool,
+  release-block: (optional uint), created-at: uint
+}))
+  (if (is-eq (get condition-type escrow-data) "MILESTONE")
+    (match (map-get? ngo-milestones { milestone-id: (get condition-value escrow-data) })
+      milestone (get is-completed milestone)
+      false
+    )
+    true
+  )
+)
+
+(define-public (refund-escrow (escrow-id uint))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrow-deposits { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+      (escrow-balance (unwrap! (map-get? escrow-balances { ngo-id: (get ngo-id escrow-data) }) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (not (get is-released escrow-data)) ERR_ESCROW_LOCKED)
+    (asserts! (> stacks-block-height (get deadline-block escrow-data)) ERR_CONDITION_NOT_MET)
+    (try! (as-contract (stx-transfer? (get amount escrow-data) tx-sender (get donor escrow-data))))
+    (map-set escrow-deposits
+      { escrow-id: escrow-id }
+      (merge escrow-data { is-released: true })
+    )
+    (map-set escrow-balances
+      { ngo-id: (get ngo-id escrow-data) }
+      (merge escrow-balance { pending-count: (- (get pending-count escrow-balance) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? escrow-deposits { escrow-id: escrow-id })
+)
+
+(define-read-only (get-ngo-escrow-balance (ngo-id uint))
+  (map-get? escrow-balances { ngo-id: ngo-id })
 )
