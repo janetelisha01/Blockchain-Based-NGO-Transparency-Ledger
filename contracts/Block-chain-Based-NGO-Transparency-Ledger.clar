@@ -16,6 +16,13 @@
 (define-constant ERR_CONDITION_NOT_MET (err u113))
 (define-constant ERR_DEADLINE_PASSED (err u114))
 
+(define-constant ERR_SUBSCRIPTION_NOT_FOUND (err u115))
+(define-constant ERR_SUBSCRIPTION_NOT_ACTIVE (err u116))
+(define-constant ERR_INTERVAL_NOT_READY (err u117))
+(define-constant ERR_SUBSCRIPTION_EXHAUSTED (err u118))
+
+(define-data-var next-subscription-id uint u1)
+
 (define-data-var next-escrow-id uint u1)
 
 (define-data-var next-milestone-id uint u1)
@@ -754,4 +761,138 @@
 
 (define-read-only (get-ngo-escrow-balance (ngo-id uint))
   (map-get? escrow-balances { ngo-id: ngo-id })
+)
+
+
+(define-map donor-subscriptions
+  { subscription-id: uint }
+  {
+    donor: principal,
+    ngo-id: uint,
+    amount-per-cycle: uint,
+    interval-blocks: uint,
+    total-cycles: uint,
+    completed-cycles: uint,
+    next-execution-block: uint,
+    is-active: bool,
+    created-at: uint,
+    last-execution: (optional uint)
+  }
+)
+
+(define-map subscription-stats
+  { ngo-id: uint }
+  { active-subscriptions: uint, total-recurring-value: uint, cycles-completed: uint }
+)
+
+(define-public (create-subscription
+  (ngo-id uint)
+  (amount-per-cycle uint)
+  (interval-blocks uint)
+  (total-cycles uint)
+)
+  (let
+    (
+      (subscription-id (var-get next-subscription-id))
+      (ngo-data (unwrap! (map-get? ngos { ngo-id: ngo-id }) ERR_NGO_NOT_FOUND))
+      (current-stats (default-to
+        { active-subscriptions: u0, total-recurring-value: u0, cycles-completed: u0 }
+        (map-get? subscription-stats { ngo-id: ngo-id })
+      ))
+    )
+    (asserts! (> amount-per-cycle u0) ERR_INVALID_AMOUNT)
+    (asserts! (> total-cycles u0) ERR_INVALID_AMOUNT)
+    (map-set donor-subscriptions
+      { subscription-id: subscription-id }
+      {
+        donor: tx-sender,
+        ngo-id: ngo-id,
+        amount-per-cycle: amount-per-cycle,
+        interval-blocks: interval-blocks,
+        total-cycles: total-cycles,
+        completed-cycles: u0,
+        next-execution-block: (+ stacks-block-height interval-blocks),
+        is-active: true,
+        created-at: stacks-block-height,
+        last-execution: none
+      }
+    )
+    (map-set subscription-stats
+      { ngo-id: ngo-id }
+      (merge current-stats {
+        active-subscriptions: (+ (get active-subscriptions current-stats) u1),
+        total-recurring-value: (+ (get total-recurring-value current-stats) (* amount-per-cycle total-cycles))
+      })
+    )
+    (var-set next-subscription-id (+ subscription-id u1))
+    (ok subscription-id)
+  )
+)
+
+(define-public (execute-subscription (subscription-id uint))
+  (let
+    (
+      (sub-data (unwrap! (map-get? donor-subscriptions { subscription-id: subscription-id }) ERR_SUBSCRIPTION_NOT_FOUND))
+      (ngo-data (unwrap! (map-get? ngos { ngo-id: (get ngo-id sub-data) }) ERR_NGO_NOT_FOUND))
+    )
+    (asserts! (get is-active sub-data) ERR_SUBSCRIPTION_NOT_ACTIVE)
+    (asserts! (>= stacks-block-height (get next-execution-block sub-data)) ERR_INTERVAL_NOT_READY)
+    (asserts! (< (get completed-cycles sub-data) (get total-cycles sub-data)) ERR_SUBSCRIPTION_EXHAUSTED)
+    (try! (stx-transfer? (get amount-per-cycle sub-data) (get donor sub-data) (get wallet ngo-data)))
+    (let
+      (
+        (new-completed (+ (get completed-cycles sub-data) u1))
+        (is-finished (>= new-completed (get total-cycles sub-data)))
+      )
+      (map-set donor-subscriptions
+        { subscription-id: subscription-id }
+        (merge sub-data {
+          completed-cycles: new-completed,
+          next-execution-block: (+ stacks-block-height (get interval-blocks sub-data)),
+          is-active: (not is-finished),
+          last-execution: (some stacks-block-height)
+        })
+      )
+      (unwrap! (update-donor-reputation (get donor sub-data) (get amount-per-cycle sub-data)) (err u0))
+      (ok true)
+    )
+  )
+)
+
+(define-public (pause-subscription (subscription-id uint))
+  (let
+    ((sub-data (unwrap! (map-get? donor-subscriptions { subscription-id: subscription-id }) ERR_SUBSCRIPTION_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get donor sub-data)) ERR_UNAUTHORIZED)
+    (map-set donor-subscriptions { subscription-id: subscription-id } (merge sub-data { is-active: false }))
+    (ok true)
+  )
+)
+
+(define-public (resume-subscription (subscription-id uint))
+  (let
+    ((sub-data (unwrap! (map-get? donor-subscriptions { subscription-id: subscription-id }) ERR_SUBSCRIPTION_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get donor sub-data)) ERR_UNAUTHORIZED)
+    (asserts! (< (get completed-cycles sub-data) (get total-cycles sub-data)) ERR_SUBSCRIPTION_EXHAUSTED)
+    (map-set donor-subscriptions { subscription-id: subscription-id } (merge sub-data { is-active: true }))
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? donor-subscriptions { subscription-id: subscription-id })
+)
+
+(define-read-only (get-ngo-subscription-stats (ngo-id uint))
+  (map-get? subscription-stats { ngo-id: ngo-id })
+)
+
+(define-read-only (is-subscription-executable (subscription-id uint))
+  (match (map-get? donor-subscriptions { subscription-id: subscription-id })
+    sub-data (ok (and 
+      (get is-active sub-data)
+      (>= stacks-block-height (get next-execution-block sub-data))
+      (< (get completed-cycles sub-data) (get total-cycles sub-data))
+    ))
+    ERR_SUBSCRIPTION_NOT_FOUND
+  )
 )
